@@ -1,0 +1,405 @@
+ 
+"""
+LEAF  -  a single procedural leaf with veins, curl and a stem
+Blender 4.x / 5.x
+
+What you get
+  * leaf blade with a pointed tip, a slightly serrated edge, a V-fold along the
+    midrib, rippled edges and a gentle droop at the tip
+  * a curved stem (petiole)
+  * a procedural shader: dark-to-light green gradient, mottling, a raised
+    midrib and side veins that sweep toward the tip, plus light shining
+    through the blade (translucency)
+  * soft studio lighting and a camera that frames the leaf
+
+HOW TO USE
+  1. Blender -> Scripting workspace -> Open this file -> Run Script.
+  2. Press F12 to render (or set RENDER_STILL = True below).
+     Image: Leaf.png      Project: Leaf.blend
+
+TWEAKING  (settings below)
+  SEED       a different seed gives a different leaf (ripples, asymmetry)
+  LENGTH / WIDTH      leaf size and how slender it is
+  SERRATION  0 = smooth edge, 0.05 = toothed
+  CURL       how much the tip droops
+  AUTUMN     True = a green -> orange -> red autumn leaf
+  TRANSPARENT_BG      True = PNG with no background
+"""
+
+import bpy
+import bmesh
+import math
+import random
+import os
+from mathutils import Vector
+
+# ------------------------------------------------------------------
+# SETTINGS
+# ------------------------------------------------------------------
+SEED = 3
+LENGTH = 1.0
+WIDTH = 0.34
+SERRATION = 0.035
+CURL = 0.28
+AUTUMN = False
+TRANSPARENT_BG = False
+QUALITY = "PREVIEW"        # "PREVIEW" (900x1200) or "FINAL" (1800x2400)
+RENDER_STILL = False       # True = render and save Leaf.png when the script runs
+
+RES = {"PREVIEW": (900, 1200, 32), "FINAL": (1800, 2400, 128)}
+
+random.seed(SEED)
+PHASE = [random.uniform(0, 6.28) for _ in range(4)]
+ASYM = random.uniform(-0.06, 0.06)
+
+# ------------------------------------------------------------------
+# CLEAN SCENE
+# ------------------------------------------------------------------
+if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+    bpy.ops.object.mode_set(mode='OBJECT')
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete(use_global=False)
+for coll in (bpy.data.meshes, bpy.data.materials, bpy.data.lights, bpy.data.cameras):
+    for block in list(coll):
+        if block.users == 0:
+            coll.remove(block)
+
+scene = bpy.context.scene
+scene.frame_start = scene.frame_end = 1
+
+# ------------------------------------------------------------------
+# LEAF SHAPE
+# ------------------------------------------------------------------
+ROWS, COLS = 120, 41          # along the leaf, across the leaf
+
+
+def half_width(u):
+    """Outline: widest about a third of the way up, pointed at both ends."""
+    w = math.sin(math.pi * u ** 0.72) ** 0.9
+    w *= 1.0 - 0.18 * u                                  # slimmer toward the tip
+    teeth = (u * 17.0) % 1.0                             # sawtooth: little teeth pointing to the tip
+    w *= 1.0 + SERRATION * (teeth - 0.5) * math.sin(math.pi * min(1.0, u * 1.4)) ** 0.5
+    return WIDTH * w
+
+
+def surface(u, v):
+    """3D position of the leaf at (u along 0..1, v across -1..1)."""
+    w = half_width(u)
+    x = v * w * (1.0 + ASYM * (1 if v > 0 else -1))
+    y = u * LENGTH
+    av = abs(v)
+    z = 0.20 * w * av ** 1.1                              # edges rise: V-fold along the midrib
+    z += 0.05 * w * av ** 2 * math.sin(u * 15.0 + PHASE[0])   # ripples on the edge
+    z += 0.03 * w * av * math.sin(u * 7.0 + PHASE[1]) * v     # a little twist
+    z += -CURL * u ** 2.2 * LENGTH * 0.6                   # tip droops
+    z += 0.05 * LENGTH * math.sin(math.pi * u) * 0.5        # soft arch along the length
+    return Vector((x, y, z))
+
+
+bm = bmesh.new()
+uv_layer = bm.loops.layers.uv.verify()
+grid = []
+for i in range(ROWS + 1):
+    u = i / ROWS
+    row = []
+    for j in range(COLS):
+        v = -1.0 + 2.0 * j / (COLS - 1)
+        row.append((bm.verts.new(surface(u, v)), u, v))
+    grid.append(row)
+for i in range(ROWS):
+    for j in range(COLS - 1):
+        a, b = grid[i][j], grid[i][j + 1]
+        c, d = grid[i + 1][j + 1], grid[i + 1][j]
+        try:
+            f = bm.faces.new((a[0], b[0], c[0], d[0]))
+        except ValueError:
+            continue
+        for loop, src in zip(f.loops, (a, b, c, d)):
+            loop[uv_layer].uv = (src[2] * 0.5 + 0.5, src[1])
+bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+me = bpy.data.meshes.new("Leaf Blade")
+bm.to_mesh(me)
+bm.free()
+for p in me.polygons:
+    p.use_smooth = True
+blade = bpy.data.objects.new("Leaf Blade", me)
+scene.collection.objects.link(blade)
+
+solid = blade.modifiers.new("Thickness", 'SOLIDIFY')
+solid.thickness = 0.006
+solid.offset = 0.0
+sub = blade.modifiers.new("Smooth", 'SUBSURF')
+sub.levels = 1
+sub.render_levels = 2
+
+# ------------------------------------------------------------------
+# STEM
+# ------------------------------------------------------------------
+def make_stem():
+    rings, sides = 14, 10
+    length = 0.42
+    bms = bmesh.new()
+    prev = None
+    base = surface(0.0, 0.0)
+    for k in range(rings + 1):
+        t = k / rings
+        c = Vector((0.03 * math.sin(t * 2.0), -t * length, base.z - 0.09 * t ** 2 + 0.01))
+        r = 0.020 - 0.009 * t
+        ring = []
+        for s in range(sides):
+            a = 2 * math.pi * s / sides
+            ring.append(bms.verts.new(c + Vector((r * math.cos(a), 0.0, r * math.sin(a)))))
+        if prev:
+            for s in range(sides):
+                bms.faces.new((prev[s], prev[(s + 1) % sides], ring[(s + 1) % sides], ring[s]))
+        prev = ring
+    bmesh.ops.contextual_create(bms, geom=prev)
+    m = bpy.data.meshes.new("Stem")
+    bms.to_mesh(m)
+    bms.free()
+    for p in m.polygons:
+        p.use_smooth = True
+    ob = bpy.data.objects.new("Leaf Stem", m)
+    scene.collection.objects.link(ob)
+    return ob
+
+
+stem = make_stem()
+
+# ------------------------------------------------------------------
+# MATERIALS
+# ------------------------------------------------------------------
+def set_input(node, names, value):
+    for nm in names:
+        if nm in node.inputs:
+            try:
+                node.inputs[nm].default_value = value
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def math_node(nt, op, a=None, b=None, clamp=False):
+    n = nt.nodes.new("ShaderNodeMath")
+    n.operation = op
+    n.use_clamp = clamp
+    if a is not None and not hasattr(a, "links"):
+        n.inputs[0].default_value = a
+    if b is not None and not hasattr(b, "links"):
+        n.inputs[1].default_value = b
+    return n
+
+
+def link(nt, src, dst, idx):
+    nt.links.new(src.outputs[0], dst.inputs[idx])
+
+
+def map_range(nt, src, f0, f1, t0, t1):
+    n = nt.nodes.new("ShaderNodeMapRange")
+    n.clamp = True
+    n.inputs["From Min"].default_value = f0
+    n.inputs["From Max"].default_value = f1
+    n.inputs["To Min"].default_value = t0
+    n.inputs["To Max"].default_value = t1
+    nt.links.new(src.outputs[0], n.inputs["Value"])
+    return n
+
+
+mat = bpy.data.materials.new("Leaf")
+mat.use_nodes = True
+nt = mat.node_tree
+nt.nodes.clear()
+out = nt.nodes.new("ShaderNodeOutputMaterial")
+bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+trans = nt.nodes.new("ShaderNodeBsdfTranslucent")
+mix = nt.nodes.new("ShaderNodeMixShader")
+mix.inputs["Fac"].default_value = 0.35
+nt.links.new(bsdf.outputs["BSDF"], mix.inputs[1])
+nt.links.new(trans.outputs["BSDF"], mix.inputs[2])
+nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+set_input(bsdf, ("Roughness",), 0.42)
+set_input(bsdf, ("Coat Weight", "Clearcoat"), 0.18)
+set_input(bsdf, ("Specular IOR Level",), 0.35)
+
+# leaf coordinates: U = across (0..1, 0.5 = midrib), V = along (0 base .. 1 tip)
+tc = nt.nodes.new("ShaderNodeTexCoord")
+sep = nt.nodes.new("ShaderNodeSeparateXYZ")
+nt.links.new(tc.outputs["UV"], sep.inputs["Vector"])
+U, V = sep.outputs["X"], sep.outputs["Y"]
+
+
+class Out:                                   # tiny wrapper so helpers accept a socket
+    def __init__(self, s):
+        self.outputs = [s]
+
+
+across = math_node(nt, 'SUBTRACT', None, 0.5)
+nt.links.new(U, across.inputs[0])
+absx = math_node(nt, 'ABSOLUTE')
+link(nt, across, absx, 0)
+vabs = math_node(nt, 'MULTIPLY', None, 2.0)       # 0 at the midrib .. 1 at the edge
+link(nt, absx, vabs, 0)
+
+# side veins: diagonal bands that sweep toward the tip, mirrored left/right
+along = math_node(nt, 'MULTIPLY', None, 13.0)
+nt.links.new(V, along.inputs[0])
+lean = math_node(nt, 'MULTIPLY', None, 2.6)
+link(nt, vabs, lean, 0)
+band = math_node(nt, 'SUBTRACT')
+link(nt, along, band, 0)
+link(nt, lean, band, 1)
+fract = math_node(nt, 'FRACT')
+link(nt, band, fract, 0)
+cen = math_node(nt, 'SUBTRACT', None, 0.5)
+link(nt, fract, cen, 0)
+dist = math_node(nt, 'ABSOLUTE')
+link(nt, cen, dist, 0)
+side = map_range(nt, dist, 0.0, 0.085, 1.0, 0.0)
+fade_edge = map_range(nt, vabs, 0.15, 0.95, 1.0, 0.0)
+fade_base = map_range(nt, Out(V), 0.02, 0.1, 0.0, 1.0)
+side_m = math_node(nt, 'MULTIPLY')
+nt.links.new(side.outputs[0], side_m.inputs[0])
+nt.links.new(fade_edge.outputs[0], side_m.inputs[1])
+side_m2 = math_node(nt, 'MULTIPLY', None, 0.75)
+link(nt, side_m, side_m2, 0)
+
+# midrib: thick at the base, thin toward the tip
+mid_w = map_range(nt, Out(V), 0.0, 1.0, 0.085, 0.012)
+mid_d = math_node(nt, 'SUBTRACT')
+link(nt, mid_w, mid_d, 0)
+link(nt, vabs, mid_d, 1)
+midrib = map_range(nt, mid_d, 0.0, 0.03, 0.0, 1.0)
+
+veins = math_node(nt, 'MAXIMUM', None, None, clamp=True)
+link(nt, midrib, veins, 0)
+link(nt, side_m2, veins, 1)
+
+# mottled colour variation
+noise = nt.nodes.new("ShaderNodeTexNoise")
+noise.inputs["Scale"].default_value = 9.0
+noise.inputs["Detail"].default_value = 6.0
+noise.inputs["Roughness"].default_value = 0.55
+nt.links.new(tc.outputs["UV"], noise.inputs["Vector"])
+
+t_noise = math_node(nt, 'MULTIPLY', None, 0.22)
+nt.links.new(noise.outputs["Fac"], t_noise.inputs[0])
+t_len = math_node(nt, 'MULTIPLY', None, 0.30)
+nt.links.new(V, t_len.inputs[0])
+t_edge = math_node(nt, 'MULTIPLY', None, 0.10)
+link(nt, vabs, t_edge, 0)
+t_vein = math_node(nt, 'MULTIPLY', None, 0.55)
+link(nt, veins, t_vein, 0)
+t1 = math_node(nt, 'ADD')
+link(nt, t_noise, t1, 0)
+link(nt, t_len, t1, 1)
+t2 = math_node(nt, 'ADD')
+link(nt, t1, t2, 0)
+link(nt, t_edge, t2, 1)
+t3 = math_node(nt, 'ADD', None, None, clamp=True)
+link(nt, t2, t3, 0)
+link(nt, t_vein, t3, 1)
+
+ramp = nt.nodes.new("ShaderNodeValToRGB")
+els = ramp.color_ramp.elements
+els.new(0.30)
+els.new(0.55)
+els.new(0.80)
+if AUTUMN:
+    stops = [(0.10, 0.16, 0.02), (0.55, 0.30, 0.03), (0.85, 0.20, 0.02), (0.95, 0.60, 0.12), (0.98, 0.78, 0.30)]
+else:
+    stops = [(0.012, 0.10, 0.015), (0.04, 0.24, 0.025), (0.12, 0.42, 0.04), (0.38, 0.58, 0.10), (0.62, 0.72, 0.28)]
+for e, c, pos in zip(els, stops, (0.0, 0.30, 0.55, 0.80, 1.0)):
+    e.color = (*c, 1.0)
+    e.position = pos
+link(nt, t3, ramp, 0)
+nt.links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+nt.links.new(ramp.outputs["Color"], trans.inputs["Color"])
+
+# veins raised / grooved slightly
+bump = nt.nodes.new("ShaderNodeBump")
+bump.invert = True
+bump.inputs["Strength"].default_value = 0.35
+bump.inputs["Distance"].default_value = 0.01
+nt.links.new(veins.outputs[0], bump.inputs["Height"])
+nt.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+
+blade.data.materials.append(mat)
+
+stem_mat = bpy.data.materials.new("Stem")
+stem_mat.use_nodes = True
+sb = stem_mat.node_tree.nodes["Principled BSDF"]
+set_input(sb, ("Base Color",), (0.17, 0.30, 0.05, 1) if not AUTUMN else (0.30, 0.15, 0.03, 1))
+set_input(sb, ("Roughness",), 0.55)
+stem.data.materials.append(stem_mat)
+
+# ------------------------------------------------------------------
+# LIGHTS, CAMERA, RENDER
+# ------------------------------------------------------------------
+sun_data = bpy.data.lights.new("Sun", 'SUN')
+sun_data.energy = 4.0
+sun_data.angle = math.radians(12)
+sun = bpy.data.objects.new("Sun", sun_data)
+scene.collection.objects.link(sun)
+sun.rotation_euler = (math.radians(38), math.radians(8), math.radians(-35))
+
+back_data = bpy.data.lights.new("Back Light", 'AREA')
+back_data.energy = 220
+back_data.size = 2.5
+back_data.color = (1.0, 0.95, 0.75)
+back = bpy.data.objects.new("Back Light", back_data)
+scene.collection.objects.link(back)
+back.location = (0.2, 0.6, -1.4)
+back.rotation_euler = (0, 0, 0)
+
+world = bpy.data.worlds.new("Studio")
+scene.world = world
+world.use_nodes = True
+wbg = world.node_tree.nodes["Background"]
+wbg.inputs["Color"].default_value = (0.95, 0.96, 0.94, 1)
+wbg.inputs["Strength"].default_value = 1.0
+
+cam_data = bpy.data.cameras.new("Camera")
+cam_data.lens = 60
+cam = bpy.data.objects.new("Camera", cam_data)
+scene.collection.objects.link(cam)
+cam.location = (0.0, 0.05, 2.95)
+cam.rotation_euler = (math.radians(5), 0, math.radians(0.5))
+scene.camera = cam
+
+rx, ry, samples = RES[QUALITY]
+scene.render.resolution_x = rx
+scene.render.resolution_y = ry
+scene.render.resolution_percentage = 100
+scene.render.film_transparent = TRANSPARENT_BG
+scene.render.image_settings.file_format = 'PNG'
+scene.render.image_settings.color_mode = 'RGBA' if TRANSPARENT_BG else 'RGB'
+base_dir = os.path.dirname(bpy.data.filepath) or os.path.expanduser("~")
+scene.render.filepath = os.path.join(base_dir, "Leaf.png")
+
+engines = [e.identifier for e in
+           bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items]
+for name in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):
+    if name in engines:
+        scene.render.engine = name
+        break
+try:
+    scene.eevee.taa_render_samples = samples
+except Exception:
+    pass
+try:
+    scene.view_settings.view_transform = 'Standard'
+except Exception:
+    pass
+
+scene.frame_set(1)
+blend_path = os.path.join(base_dir, "Leaf.blend")
+bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+
+print("Leaf: scene generated.")
+print(f"  {len(me.polygons)} faces, {'autumn' if AUTUMN else 'green'} leaf, {rx}x{ry}")
+print(f"  Saved to {blend_path}   (render with F12; PNG goes to {scene.render.filepath})")
+
+if RENDER_STILL:
+    bpy.ops.render.render(write_still=True)
+    print("  Rendered", scene.render.filepath)
